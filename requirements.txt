@@ -1,0 +1,2 @@
+# no third-party packages: the agent uses only the Python standard library.
+# this file only tells Railway that the project is Python.

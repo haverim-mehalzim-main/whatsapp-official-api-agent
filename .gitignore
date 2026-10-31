@@ -1,0 +1,9 @@
+# secrets and runtime state
+.env
+.env.txt
+triage_state.json
+__pycache__/
+
+# guide files with screenshots (they show phone numbers and emails)
+screenshots/
+README*.md

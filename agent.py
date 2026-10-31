@@ -1,0 +1,365 @@
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import oncall
+import send_test
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(HERE, ".env.txt")
+PROMPT_FILE = os.path.join(HERE, "system_prompt.txt")
+# on a server DATA_DIR points at a persistent volume; without one the file is lost on every redeploy
+STATE_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "triage_state.json")
+MODEL = "claude-haiku-5-5"  # a yes/no/unclear call per message; the small model is enough and cheaper
+MAX_HISTORY = 20  # messages kept per sender
+ALERT_RETRY_SECONDS = 30
+
+YES_ID, NO_ID = "emergency_yes", "emergency_no"
+DEFAULT_HANDOFF = (
+    "קיבלנו. נציג שלנו יחזור אליך בהקדם האפשרי כדי לברר פרטים נוספים. / "
+    "A representative will get back to you as soon as possible to ask for more details."
+)
+# used when the model is unreachable or answers garbage: failing towards asking beats staying silent
+FALLBACK_QUESTION = {
+    "assessment": "unclear",
+    "message": "היי, כאן חברים מחלצים. רק כדי לוודא, זה מצב חירום עכשיו? / Just to make sure, is this an emergency right now?",
+    "yes_label": "כן, זה חירום",
+    "no_label": "לא, זה לא חירום",
+    "handoff": DEFAULT_HANDOFF,
+    "summary": "אין פרטים",
+}
+
+HISTORY = {}
+SEEN_IDS = []
+LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
+DRY_RUN = False
+
+
+ENV_KEYS = (
+    "whatsapp_api_permanent_token",
+    "anthropic_api_key",
+    "whatsapp_verify_token",
+    "meta_app_secret",
+    "whatsapp_business_account_id",
+    "meta_app_id",
+    "twilio_account_sid",
+    "twilio_auth_token",
+    "twilio_number",
+    "whatsapp_template_name",
+    "whatsapp_template_language",
+    "incident_agent_url",
+    "incident_agent_secret",
+)
+
+
+def load_env():
+    # locally the values live in .env.txt; on a server there is no such file, they are environment variables
+    values = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key.strip() and not key.startswith("#"):
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+    values.update({k: os.environ[k].strip() for k in ENV_KEYS if os.environ.get(k)})
+    return values
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+# per sender: {"status": "emergency", "incident_id", "summary", "alert": "pending"|"sent"} once handed
+# over, or {"handoff", "summary"} while the question is open. On disk so a restart does not wake the
+# agent up again on a conversation that was already handed to a person.
+STATE = load_state()
+
+
+def save_state():
+    if DRY_RUN:
+        return
+    with STATE_LOCK:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
+
+
+def system_prompt():
+    with open(PROMPT_FILE, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def ask_claude(history):
+    api_key = load_env().get("anthropic_api_key")
+    if not api_key:
+        raise RuntimeError("anthropic_api_key is empty in .env.txt")
+    body = json.dumps(
+        {"model": MODEL, "max_tokens": 500, "system": system_prompt(), "messages": history}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        method="POST",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Claude API error {e.code}: {e.read().decode('utf-8', 'replace')}")
+    return "".join(block.get("text", "") for block in data["content"]).strip()
+
+
+def parse_verdict(raw):
+    verdict = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+    if verdict.get("assessment") not in ("emergency", "not_emergency", "unclear"):
+        raise ValueError("unknown assessment")
+    if not str(verdict.get("message", "")).strip():
+        raise ValueError("empty message")
+    return verdict
+
+
+def send_text(to, text):
+    print(f"[reply to {to}] {text}")
+    if DRY_RUN:
+        return
+    result = send_test.send_text(to, text)
+    if "error" in result:
+        print(f"[send error] {result['error']}")
+
+
+def send_question(to, text, yes_label, no_label):
+    # two tap buttons; they only work inside the 24h window, which is always open after a message
+    print(f"[question to {to}] {text}  [{yes_label}] [{no_label}]")
+    if DRY_RUN:
+        return
+    buttons = [
+        {"type": "reply", "reply": {"id": YES_ID, "title": yes_label[:20]}},
+        {"type": "reply", "reply": {"id": NO_ID, "title": no_label[:20]}},
+    ]
+    result = send_test.send(
+        to,
+        {
+            "type": "interactive",
+            "interactive": {"type": "button", "body": {"text": text[:1024]}, "action": {"buttons": buttons}},
+        },
+    )
+    if "error" in result:
+        print(f"[send error] {result['error']}")
+        send_test.send_text(to, text)
+
+
+def try_alert(sender):
+    # tell the on-call group; safe to repeat, the incident id is the same on every attempt
+    record = STATE.get(sender, {})
+    if record.get("alert") != "pending":
+        return True
+    text = oncall.build_text(sender, record.get("summary") or "אין פרטים")
+    if DRY_RUN:
+        print(f"[dry run] would post to the on-call group:\n{text}")
+        ok = True
+    else:
+        ok = oncall.send_report(record["incident_id"], text)
+    if ok:
+        record["alert"] = "sent"
+        save_state()
+    else:
+        print(f"[ALERT NOT SENT] {sender} is waiting for the on-call group, will retry")
+    return ok
+
+
+def alert_retry_loop():
+    while True:
+        time.sleep(ALERT_RETRY_SECONDS)
+        for sender in [s for s, r in STATE.items() if r.get("alert") == "pending"]:
+            try:
+                try_alert(sender)
+            except Exception as e:
+                print(f"[alert retry error] {e}")
+
+
+def declare_emergency(sender, handoff, summary):
+    # from here on the conversation belongs to a person: the agent never answers it again
+    STATE[sender] = {
+        "status": "emergency",
+        "incident_id": f"wa-{sender}-{int(time.time())}",
+        "summary": summary or "אין פרטים",
+        "alert": "pending",
+    }
+    save_state()
+    HISTORY.pop(sender, None)
+    try_alert(sender)
+    send_text(sender, handoff or DEFAULT_HANDOFF)
+
+
+def reply_to(sender, text, button=None):
+    if STATE.get(sender, {}).get("status") == "emergency":
+        print(f"[ignored] {sender} was already handed to a representative")
+        return
+    if button == YES_ID:
+        record = STATE.get(sender, {})
+        declare_emergency(sender, record.get("handoff"), record.get("summary"))
+        return
+    if button == NO_ID:
+        text = f'[The person tapped "{text}": this is NOT an emergency]'
+    history = HISTORY.setdefault(sender, [])
+    history.append({"role": "user", "content": text})
+    del history[:-MAX_HISTORY]
+    while history and history[0]["role"] != "user":
+        history.pop(0)
+    try:
+        raw = ask_claude(history)
+    except Exception as e:
+        print(f"[error] {e}")
+        history.pop()
+        verdict = FALLBACK_QUESTION
+    else:
+        try:
+            verdict = parse_verdict(raw)
+        except ValueError as e:
+            print(f"[error] unreadable answer from the model ({e})")
+            verdict = FALLBACK_QUESTION
+            raw = json.dumps(verdict, ensure_ascii=False)
+        history.append({"role": "assistant", "content": raw})
+    print(f"[assessment {sender}] {verdict['assessment']}")
+
+    if verdict["assessment"] == "emergency":
+        declare_emergency(sender, verdict.get("handoff") or verdict["message"], verdict.get("summary"))
+    elif verdict["assessment"] == "unclear":
+        STATE[sender] = {"handoff": verdict.get("handoff"), "summary": verdict.get("summary")}
+        save_state()
+        send_question(
+            sender,
+            verdict["message"],
+            verdict.get("yes_label") or FALLBACK_QUESTION["yes_label"],
+            verdict.get("no_label") or FALLBACK_QUESTION["no_label"],
+        )
+    else:
+        send_text(sender, verdict["message"])
+
+
+def describe(message):
+    # (text for the model, tapped button id or None); a caller in trouble may send a pin or a voice
+    # note instead of words, and that still has to reach the model
+    kind = message.get("type")
+    if kind == "text":
+        return message["text"]["body"], None
+    if kind == "interactive":
+        reply = message["interactive"].get("button_reply") or {}
+        return reply.get("title", ""), reply.get("id")
+    if kind == "location":
+        place = message["location"]
+        return f"[shared a location pin: {place.get('latitude')}, {place.get('longitude')} {place.get('name', '')}]", None
+    return f"[sent a {kind} message that cannot be read automatically]", None
+
+
+def handle_message(message):
+    sender, message_id = message.get("from"), message.get("id")
+    with LOCK:
+        if message_id in SEEN_IDS:
+            return
+        SEEN_IDS.append(message_id)
+        del SEEN_IDS[:-500]
+        text, button = describe(message)
+        print(f"[message from {sender}] {text}")
+        reply_to(sender, text, button)
+
+
+def handle_payload(payload):
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                handle_message(message)
+            for status in value.get("statuses", []):
+                errors = status.get("errors")
+                print(f"[status] {status.get('recipient_id')} {status.get('status')}" + (f" errors={errors}" if errors else ""))
+                import alert  # imported here because alert imports agent
+
+                alert.on_status(status)
+
+
+class Webhook(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Meta's one-time verification handshake
+        from urllib.parse import parse_qs, urlparse
+
+        query = parse_qs(urlparse(self.path).query)
+        token = load_env().get("whatsapp_verify_token")
+        if query.get("hub.mode") == ["subscribe"] and token and query.get("hub.verify_token") == [token]:
+            self.respond(200, query["hub.challenge"][0])
+        else:
+            self.respond(403, "forbidden")
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        secret = load_env().get("meta_app_secret")
+        if secret:
+            expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, self.headers.get("X-Hub-Signature-256", "")):
+                self.respond(403, "bad signature")
+                return
+        self.respond(200, "ok")  # answer Meta fast, work in the background
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return
+        threading.Thread(target=handle_payload, args=(payload,), daemon=True).start()
+
+    def respond(self, code, text):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(text.encode("utf-8"))
+
+    def log_message(self, *args):
+        pass
+
+
+def chat():
+    # talk to the agent in the terminal, nothing is sent to WhatsApp or to the on-call group
+    print("Chatting with the agent (Ctrl+C to quit). Type /yes or /no to tap the answer buttons.")
+    while True:
+        text = input("you: ")
+        if text == "/yes":
+            reply_to("terminal", "Yes", YES_ID)
+        elif text == "/no":
+            reply_to("terminal", "No", NO_ID)
+        else:
+            reply_to("terminal", text)
+
+
+# alerts that failed (or were cut short by a restart) keep being retried until the group has them
+threading.Thread(target=alert_retry_loop, daemon=True).start()
+
+
+if __name__ == "__main__":
+    # usage: python agent.py              -> run the webhook server on port 8080
+    #        python agent.py --dry-run    -> same, but print replies instead of sending them
+    #        python agent.py --chat       -> test the agent in the terminal
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--chat", action="store_true")
+    args = parser.parse_args()
+    DRY_RUN = args.dry_run or args.chat
+    if args.chat:
+        chat()
+    else:
+        print(f"Webhook listening on port {args.port}" + (" (dry run)" if DRY_RUN else ""))
+        ThreadingHTTPServer(("", args.port), Webhook).serve_forever()
