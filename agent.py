@@ -91,8 +91,14 @@ def save_state():
     if DRY_RUN:
         return
     with STATE_LOCK:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, ensure_ascii=False, indent=2)
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(STATE, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            # never let a storage problem stop a caller from being helped or an emergency from being reported;
+            # the state stays in memory, but it will be lost on a restart until the folder is writable
+            print(f"[state error] could not save {STATE_FILE}: {e}")
 
 
 def system_prompt():

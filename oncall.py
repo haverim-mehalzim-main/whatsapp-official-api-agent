@@ -24,7 +24,7 @@ def send_report(incident_id, text):
     env = agent.load_env()
     base, secret = env.get("incident_agent_url", "").rstrip("/"), env.get("incident_agent_secret", "")
     if not base or not secret:
-        print("[oncall error] incident_agent_url / incident_agent_secret are empty in .env.txt")
+        print("[oncall error] incident_agent_url / incident_agent_secret are empty (.env.txt or environment variables)")
         return False
     request = urllib.request.Request(
         base + PATH,
