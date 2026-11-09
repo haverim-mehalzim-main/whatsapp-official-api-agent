@@ -22,13 +22,11 @@ MAX_HISTORY = 20  # messages kept per sender
 ALERT_RETRY_SECONDS = 30
 
 # after the handover the model is never called again, but a caller who keeps writing must not be met with silence:
-# a fixed text (no tokens), at most once per cooldown
+# every message gets this fixed text (no tokens); the on-call group was told once, when the caller was handed over
 FOLLOWUP_REPLY = (
     "קיבלנו את ההודעה שלך והעברנו אותה לנציג. הוא יחזור אליך בהקדם האפשרי. / "
     "We got your message and passed it on to the representative. They will get back to you as soon as possible."
 )
-FOLLOWUP_COOLDOWN_SECONDS = 600
-LAST_NOTICE = {}  # sender -> time of the last handover text or fixed reply
 
 YES_ID, NO_ID = "emergency_yes", "emergency_no"
 DEFAULT_HANDOFF = (
@@ -220,16 +218,11 @@ def declare_emergency(sender, handoff, summary):
     HISTORY.pop(sender, None)
     try_alert(sender)
     send_text(sender, handoff or DEFAULT_HANDOFF)
-    LAST_NOTICE[sender] = time.time()
 
 
 def reply_to(sender, text, button=None):
     if STATE.get(sender, {}).get("status") == "emergency":
-        # no model call, ever; only the fixed text, and not more often than the cooldown
-        if time.time() - LAST_NOTICE.get(sender, 0) < FOLLOWUP_COOLDOWN_SECONDS:
-            print(f"[ignored] {sender} was already handed to a representative")
-            return
-        LAST_NOTICE[sender] = time.time()
+        # no model call and no new alert to the group, ever; only the fixed text
         print(f"[fixed reply] {sender} was already handed to a representative")
         send_text(sender, FOLLOWUP_REPLY)
         return
