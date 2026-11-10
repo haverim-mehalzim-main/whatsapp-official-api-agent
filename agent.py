@@ -69,6 +69,8 @@ ENV_KEYS = (
     "incident_agent_url",
     "incident_agent_secret",
     "backup_alert_numbers",
+    "admin_secret",
+    "test_numbers",
 )
 
 
@@ -154,6 +156,34 @@ def health():
         "pending_alerts": len(pending),
         "oldest_pending_seconds": oldest,
     }
+
+
+def digits(number):
+    return "".join(ch for ch in str(number) if ch.isdigit())
+
+
+def reset_test_number(number, key):
+    # testing helper: forget one number so it can be tried again from the beginning. It only works when
+    # admin_secret is set, the key matches, and the number is listed in test_numbers, so a real caller
+    # can never be reset. Returns (http code, message).
+    env = load_env()
+    secret = env.get("admin_secret", "")
+    if not secret:
+        return 404, "not found"  # switched off until a secret is configured
+    if not key or not hmac.compare_digest(str(key), secret):
+        print("[admin reset] refused: wrong key")
+        return 403, "forbidden"
+    number = digits(number)
+    allowed = [digits(n) for n in env.get("test_numbers", "").split(",") if digits(n)]
+    if not number or number not in allowed:
+        print("[admin reset] refused: number is not a test number")
+        return 403, "not a test number"
+    with LOCK:  # the same lock as incoming messages, so a message cannot be half-processed during the reset
+        STATE.pop(number, None)
+        HISTORY.pop(number, None)
+        save_state()
+    print(f"[admin reset] {number} was reset")
+    return 200, f"reset {number}: it will start from the beginning"
 
 
 def startup_checks():
@@ -405,8 +435,15 @@ class Webhook(BaseHTTPRequestHandler):
         if urlparse(self.path).path == "/health":
             self.health_response(True)
             return
-        # Meta's one-time verification handshake
         query = parse_qs(urlparse(self.path).query)
+        if urlparse(self.path).path == "/admin/reset":
+            bearer = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            code, message = reset_test_number(
+                (query.get("number") or [""])[0], (query.get("key") or [""])[0] or bearer
+            )
+            self.respond(code, message)
+            return
+        # Meta's one-time verification handshake
         token = load_env().get("whatsapp_verify_token")
         if query.get("hub.mode") == ["subscribe"] and token and query.get("hub.verify_token") == [token]:
             self.respond(200, query["hub.challenge"][0])
