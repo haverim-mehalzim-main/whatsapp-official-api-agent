@@ -25,7 +25,7 @@ def twilio_post(path, params):
     sid = env.get("twilio_account_sid")
     token = env.get("twilio_auth_token")
     if not sid or not token:
-        raise RuntimeError("twilio_account_sid / twilio_auth_token are empty in .env.txt")
+        raise RuntimeError("twilio_account_sid / twilio_auth_token are empty in .env")
     credentials = base64.b64encode(f"{sid}:{token}".encode()).decode()
     request = urllib.request.Request(
         f"https://api.twilio.com/2010-04-01/Accounts/{sid}/{path}.json",

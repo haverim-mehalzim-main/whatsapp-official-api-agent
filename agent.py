@@ -13,7 +13,7 @@ import oncall
 import send_test
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENV_FILE = os.path.join(HERE, ".env.txt")
+ENV_FILE = os.path.join(HERE, ".env")
 PROMPT_FILE = os.path.join(HERE, "system_prompt.txt")
 # on a server DATA_DIR points at a persistent volume; without one the file is lost on every redeploy
 STATE_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "triage_state.json")
@@ -68,7 +68,7 @@ ENV_KEYS = (
 
 
 def load_env():
-    # locally the values live in .env.txt; on a server there is no such file, they are environment variables
+    # locally the values live in .env; on a server there is no such file, they are environment variables
     values = {}
     if os.path.exists(ENV_FILE):
         with open(ENV_FILE, encoding="utf-8") as f:
@@ -116,7 +116,7 @@ def system_prompt():
 def ask_claude(history):
     api_key = load_env().get("anthropic_api_key")
     if not api_key:
-        raise RuntimeError("anthropic_api_key is empty in .env.txt")
+        raise RuntimeError("anthropic_api_key is empty in .env")
     body = json.dumps(
         {"model": MODEL, "max_tokens": 500, "system": system_prompt(), "messages": history}
     ).encode("utf-8")
