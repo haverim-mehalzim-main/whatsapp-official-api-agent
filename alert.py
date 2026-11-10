@@ -40,12 +40,12 @@ def twilio_post(path, params):
         raise RuntimeError(f"Twilio error {e.code}: {e.read().decode('utf-8', 'replace')}")
 
 
-def place_call(employee_number):
+def place_call(employee_number, twiml=CALL_TWIML):
     if DRY_RUN:
         print(f"[dry run] call {employee_number}")
         return "dry-run"
     number = agent.load_env().get("twilio_number")
-    return twilio_post("Calls", {"To": employee_number, "From": number, "Twiml": CALL_TWIML})["sid"]
+    return twilio_post("Calls", {"To": employee_number, "From": number, "Twiml": twiml})["sid"]
 
 
 def send_sms(employee_number, callback_number):
@@ -97,6 +97,40 @@ def alert_employee(employee_number, callback_number):
             print(f"[call error] {e}")
             call_sid = None
         return call_sid, whatsapp_future.result()
+
+
+ESCALATION_CALL_TWIML = (
+    "<Response><Say>Urgent. An emergency report received on WhatsApp could not be delivered "
+    "to the on call group. Please check your messages now and call the sender back.</Say></Response>"
+)
+ESCALATION_WARNED = set()  # senders already logged as "no backup numbers configured", to keep the log readable
+
+
+def escalate(sender, summary):
+    # the on-call group could not be reached for too long: SMS and call the backup numbers directly.
+    # returns True when at least one of them was reached; needs Twilio and backup_alert_numbers to be set
+    env = agent.load_env()
+    numbers = [n.strip() for n in env.get("backup_alert_numbers", "").split(",") if n.strip()]
+    if not numbers or not env.get("twilio_account_sid") or not env.get("twilio_auth_token"):
+        if sender not in ESCALATION_WARNED:
+            ESCALATION_WARNED.add(sender)
+            print(f"[ESCALATION IMPOSSIBLE] {sender}: backup_alert_numbers and the Twilio settings are not configured")
+        return False
+    text = f"🚨 פנייה דחופה בוואטסאפ מ-+{sender} לא הגיעה לקבוצת הכוננים. {summary or 'אין פרטים'}. יש לבדוק מיד ולחזור אליו."
+    reached = False
+    for number in numbers:
+        for what, action in (
+            ("sms", lambda n=number: twilio_post("Messages", {"To": n, "From": env.get("twilio_number"), "Body": text})
+             if not DRY_RUN else print(f"[dry run] sms to {n}: {text}")),
+            ("call", lambda n=number: place_call(n, ESCALATION_CALL_TWIML)),
+        ):
+            try:
+                action()
+                reached = True
+                print(f"[escalation] {what} to a backup number done")
+            except Exception as e:
+                print(f"[escalation error] {what}: {e}")
+    return reached
 
 
 def on_status(status):

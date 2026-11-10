@@ -20,6 +20,10 @@ STATE_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "triage_state.json")
 MODEL = "claude-haiku-5-5"  # a yes/no/unclear call per message; the small model is enough and cheaper
 MAX_HISTORY = 20  # messages kept per sender
 ALERT_RETRY_SECONDS = 30
+# an emergency that the on-call group has not received after this long is also sent to the backup numbers,
+# and /health?strict=1 starts to fail so an uptime monitor can warn you
+ESCALATE_AFTER_SECONDS = 300
+STARTED_AT = time.time()
 
 # after the handover the model is never called again, but a caller who keeps writing must not be met with silence:
 # every message gets this fixed text (no tokens); the on-call group was told once, when the caller was handed over
@@ -64,6 +68,7 @@ ENV_KEYS = (
     "whatsapp_template_language",
     "incident_agent_url",
     "incident_agent_secret",
+    "backup_alert_numbers",
 )
 
 
@@ -106,6 +111,57 @@ def save_state():
             # never let a storage problem stop a caller from being helped or an emergency from being reported;
             # the state stays in memory, but it will be lost on a restart until the folder is writable
             print(f"[state error] could not save {STATE_FILE}: {e}")
+
+
+def alert_age(record):
+    # seconds since the caller was handed over (older records only carry the time inside the incident id)
+    since = record.get("since")
+    if since is None:
+        try:
+            since = int(str(record.get("incident_id", "")).rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            since = time.time()
+    return time.time() - since
+
+
+def state_dir_writable():
+    folder = os.path.dirname(STATE_FILE)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(folder, os.W_OK)
+
+
+def health():
+    # numbers and flags only, never a caller's number or text: this page is public
+    pending = [r for r in STATE.values() if r.get("alert") == "pending"]
+    oldest = int(max((alert_age(r) for r in pending), default=0))
+    data_dir = os.environ.get("DATA_DIR")
+    warnings = []
+    if data_dir and not os.path.ismount(data_dir):
+        warnings.append("DATA_DIR is not a mounted volume: the handover state is lost on every restart")
+    problems = []
+    if not state_dir_writable():
+        problems.append("the state folder is not writable")
+    if oldest > ESCALATE_AFTER_SECONDS:
+        problems.append("an emergency alert has not reached the on-call group for too long")
+    return {
+        "status": "problem" if problems else "ok",
+        "problems": problems,
+        "warnings": warnings,
+        "uptime_seconds": int(time.time() - STARTED_AT),
+        "pending_alerts": len(pending),
+        "oldest_pending_seconds": oldest,
+    }
+
+
+def startup_checks():
+    # called once when the server starts, so a missing volume shows up in the logs right away
+    info = health()
+    for text in info["problems"] + info["warnings"]:
+        print(f"[startup warning] {text}", flush=True)
+    print(f"[startup] state file: {STATE_FILE}, {len(STATE)} saved conversations", flush=True)
 
 
 def system_prompt():
@@ -196,14 +252,27 @@ def try_alert(sender):
     return ok
 
 
+def retry_pending_alerts():
+    for sender in [s for s, r in STATE.items() if r.get("alert") == "pending"]:
+        record = STATE[sender]
+        try:
+            if try_alert(sender):
+                continue
+            # the group still does not have it: after a while, tell the backup numbers too (once)
+            if alert_age(record) > ESCALATE_AFTER_SECONDS and not record.get("escalated"):
+                import alert  # imported here because alert imports agent
+
+                if alert.escalate(sender, record.get("summary")):
+                    record["escalated"] = True
+                    save_state()
+        except Exception as e:
+            print(f"[alert retry error] {e}")
+
+
 def alert_retry_loop():
     while True:
         time.sleep(ALERT_RETRY_SECONDS)
-        for sender in [s for s, r in STATE.items() if r.get("alert") == "pending"]:
-            try:
-                try_alert(sender)
-            except Exception as e:
-                print(f"[alert retry error] {e}")
+        retry_pending_alerts()
 
 
 def declare_emergency(sender, handoff, summary):
@@ -213,6 +282,7 @@ def declare_emergency(sender, handoff, summary):
         "incident_id": f"wa-{sender}-{int(time.time())}",
         "summary": summary or "אין פרטים",
         "alert": "pending",
+        "since": int(time.time()),
     }
     save_state()
     HISTORY.pop(sender, None)
@@ -310,10 +380,32 @@ def handle_payload(payload):
 
 
 class Webhook(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Meta's one-time verification handshake
+    def health_response(self, send_body):
+        # /health always answers 200 while the process is alive (Railway's health check uses it);
+        # /health?strict=1 answers 503 when something needs a person, which is what an uptime monitor should watch
         from urllib.parse import parse_qs, urlparse
 
+        strict = parse_qs(urlparse(self.path).query).get("strict") == ["1"]
+        info = health()
+        code = 503 if strict and info["status"] != "ok" else 200
+        self.respond(code, json.dumps(info), "application/json", send_body)
+
+    def do_HEAD(self):
+        # some uptime monitors check with HEAD
+        from urllib.parse import urlparse
+
+        if urlparse(self.path).path == "/health":
+            self.health_response(False)
+        else:
+            self.respond(403, "forbidden", send_body=False)
+
+    def do_GET(self):
+        from urllib.parse import parse_qs, urlparse
+
+        if urlparse(self.path).path == "/health":
+            self.health_response(True)
+            return
+        # Meta's one-time verification handshake
         query = parse_qs(urlparse(self.path).query)
         token = load_env().get("whatsapp_verify_token")
         if query.get("hub.mode") == ["subscribe"] and token and query.get("hub.verify_token") == [token]:
@@ -336,11 +428,14 @@ class Webhook(BaseHTTPRequestHandler):
             return
         threading.Thread(target=handle_payload, args=(payload,), daemon=True).start()
 
-    def respond(self, code, text):
+    def respond(self, code, text, content_type="text/plain", send_body=True):
+        body = text.encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(text.encode("utf-8"))
+        if send_body:
+            self.wfile.write(body)
 
     def log_message(self, *args):
         pass
@@ -377,4 +472,5 @@ if __name__ == "__main__":
         chat()
     else:
         print(f"Webhook listening on port {args.port}" + (" (dry run)" if DRY_RUN else ""))
+        startup_checks()
         ThreadingHTTPServer(("", args.port), Webhook).serve_forever()
