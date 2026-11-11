@@ -33,6 +33,23 @@ FOLLOWUP_REPLY = (
 )
 
 YES_ID, NO_ID = "emergency_yes", "emergency_no"
+# the first message from a new caller, whatever it says, is always answered with this question and two buttons
+GREETING = "היי זה יוני מחברים מחלצים, אתה או מישהו שאתה מכיר נמצא עכשיו במצב חירום בחו״ל?"
+
+# once a caller is handed over they get these two messages, one after the other
+HANDOFF_TEXT = "מיד אצור איתך קשר ממספר אחר"
+DETAILS_QUESTIONS = "בינתיים תכתוב לי בבקשה\nמה השם המלא שלך?\nאיפה בעולם קרה האירוע?\nתיאור קצר של מה קרה."
+
+# the details window: for this long after the questions, what the caller writes is collected (no reply to the
+# caller), read by the model in small batches, and passed to the on-call group as updates
+DETAILS_PROMPT_FILE = os.path.join(HERE, "details_prompt.txt")
+DETAILS_WINDOW_SECONDS = 300
+DETAILS_QUIET_SECONDS = 30  # a batch goes to the model once the caller has stopped writing for this long
+DETAILS_TICK_SECONDS = 5
+MAX_DETAIL_CHARS = 500  # per message
+MAX_WINDOW_CHARS = 2000  # per window; what goes past it is counted, not read
+MAX_DETAIL_CALLS = 5  # model calls per window; past it, batches go to the group as written
+MEDIA_NAMES = {"audio": "הקלטה", "voice": "הקלטה", "image": "תמונה", "video": "סרטון", "document": "מסמך", "sticker": "מדבקה"}
 DEFAULT_HANDOFF = (
     "קיבלנו. נציג שלנו יחזור אליך בהקדם האפשרי כדי לברר פרטים נוספים. / "
     "A representative will get back to you as soon as possible to ask for more details."
@@ -199,12 +216,12 @@ def system_prompt():
         return f.read().strip()
 
 
-def ask_claude(history):
+def ask_claude(history, system=None, max_tokens=500):
     api_key = load_env().get("anthropic_api_key")
     if not api_key:
         raise RuntimeError("anthropic_api_key is empty in .env")
     body = json.dumps(
-        {"model": MODEL, "max_tokens": 500, "system": system_prompt(), "messages": history}
+        {"model": MODEL, "max_tokens": max_tokens, "system": system or system_prompt(), "messages": history}
     ).encode("utf-8")
     request = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -268,7 +285,7 @@ def try_alert(sender):
     record = STATE.get(sender, {})
     if record.get("alert") != "pending":
         return True
-    text = oncall.build_text(sender, record.get("summary") or "אין פרטים")
+    text = oncall.build_text(sender)
     if DRY_RUN:
         print(f"[dry run] would post to the on-call group:\n{text}")
         ok = True
@@ -277,13 +294,19 @@ def try_alert(sender):
     if ok:
         record["alert"] = "sent"
         save_state()
+        send_detail_updates(record)  # updates that were waiting for the first alert
     else:
         print(f"[ALERT NOT SENT] {sender} is waiting for the on-call group, will retry")
     return ok
 
 
 def retry_pending_alerts():
-    for sender in [s for s, r in STATE.items() if r.get("alert") == "pending"]:
+    for record in list(STATE.values()):
+        try:
+            send_detail_updates(record)
+        except Exception as e:
+            print(f"[details retry error] {e}")
+    for sender in [s for s, r in list(STATE.items()) if r.get("alert") == "pending"]:
         record = STATE[sender]
         try:
             if try_alert(sender):
@@ -305,33 +328,203 @@ def alert_retry_loop():
         retry_pending_alerts()
 
 
-def declare_emergency(sender, handoff, summary):
-    # from here on the conversation belongs to a person: the agent never answers it again
+def declare_emergency(sender, summary):
+    # from here on the conversation belongs to a person: the model never answers it again. The caller gets the
+    # fixed handoff and the details questions, the on-call group gets the first alert, and the details window opens
+    now = int(time.time())
     STATE[sender] = {
         "status": "emergency",
-        "incident_id": f"wa-{sender}-{int(time.time())}",
+        "incident_id": f"wa-{sender}-{now}",
         "summary": summary or "אין פרטים",
         "alert": "pending",
-        "since": int(time.time()),
+        "since": now,
+        "details": {
+            "until": now + DETAILS_WINDOW_SECONDS,
+            "last_at": now,
+            "pending": [],  # collected messages the model has not read yet
+            "fields": {"name": "", "location": "", "what": ""},
+            "chars": 0,
+            "calls": 0,
+            "dropped": 0,
+            "dropped_reported": 0,
+            "updates": [],  # [{"id", "text", "sent"}], posted to the group in order, after the first alert
+        },
     }
     save_state()
     HISTORY.pop(sender, None)
+    # the caller first, so they are never kept waiting on the incident bot; the alert is retried if it fails
+    send_text(sender, HANDOFF_TEXT)
+    send_text(sender, DETAILS_QUESTIONS)
     try_alert(sender)
-    send_text(sender, handoff or DEFAULT_HANDOFF)
 
 
-def reply_to(sender, text, button=None):
-    if STATE.get(sender, {}).get("status") == "emergency":
-        # no model call and no new alert to the group, ever; only the fixed text
+def collect_detail(record, item):
+    # keep one caller message for the details window; False when there is no open window
+    details = record.get("details")
+    if not details or time.time() >= details["until"]:
+        return False
+    room = MAX_WINDOW_CHARS - details["chars"]
+    if room <= 0:
+        details["dropped"] += 1
+    else:
+        text = item["text"][: min(MAX_DETAIL_CHARS, room)]
+        details["chars"] += len(text)
+        details["pending"].append({**item, "text": text})
+    details["last_at"] = time.time()
+    save_state()
+    return True
+
+
+def details_prompt():
+    with open(DETAILS_PROMPT_FILE, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def extract_details(known, texts):
+    # one short model call: what is known so far plus only the new messages; returns (fields, is_new)
+    content = json.dumps({"known": known, "new_messages": texts}, ensure_ascii=False)
+    raw = ask_claude([{"role": "user", "content": content}], system=details_prompt(), max_tokens=300)
+    answer = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+    fields = {key: str(answer.get(key) or "").strip() for key in ("name", "location", "what")}
+    return fields, bool(answer.get("new"))
+
+
+FLUSHING = set()  # senders whose batch is with the model right now
+
+
+def flush_details(sender):
+    # read the waiting messages with the model and, when they add something (or carry a pin or media),
+    # queue an update for the on-call group. The model is called outside the lock so incoming messages
+    # are never held up; messages are removed only once the update is queued, so a restart loses nothing
+    with LOCK:
+        record = STATE.get(sender, {})
+        details = record.get("details")
+        new_dropped = details["dropped"] - details["dropped_reported"] if details else 0
+        if not details or sender in FLUSHING or not (details["pending"] or new_dropped):
+            return
+        batch = list(details["pending"])
+        known = dict(details["fields"])
+        use_model = details["calls"] < MAX_DETAIL_CALLS and bool(batch)
+        if use_model:
+            details["calls"] += 1
+        FLUSHING.add(sender)
+    try:
+        fields, is_new = known, None  # None: the model was not asked or did not answer
+        if use_model:
+            try:
+                fields, is_new = extract_details(known, [item["text"] for item in batch])
+            except Exception as e:
+                print(f"[details error] {e}; passing the messages on as written")
+                fields, is_new = known, None
+        with LOCK:
+            del details["pending"][: len(batch)]
+            always = new_dropped or any(item.get("always") for item in batch)
+            if is_new is False and not always:
+                print(f"[details] {sender}: nothing new, no update")
+                save_state()
+                return
+            details["fields"] = fields
+            details["dropped_reported"] = details["dropped"]
+            number = len(details["updates"]) + 1
+            details["updates"].append(
+                {
+                    "id": f"{record['incident_id']}-details-{number}",
+                    "text": oncall.build_details_text(sender, fields, [item["line"] for item in batch], new_dropped),
+                    "sent": False,
+                }
+            )
+            save_state()
+    finally:
+        FLUSHING.discard(sender)
+    send_detail_updates(record)
+
+
+def send_detail_updates(record):
+    # post queued updates in order, and only after the first alert, so the group never gets an update
+    # before it knows about the emergency; safe to repeat, the incident bot ignores an id it already has
+    details = record.get("details")
+    if not details or record.get("alert") != "sent":
+        return
+    for update in details["updates"]:
+        if update["sent"]:
+            continue
+        if DRY_RUN:
+            print(f"[dry run] would post to the on-call group:\n{update['text']}")
+            ok = True
+        else:
+            ok = oncall.send_report(update["id"], update["text"])
+        if not ok:
+            print(f"[UPDATE NOT SENT] {update['id']}, will retry")
+            return
+        update["sent"] = True
+        save_state()
+
+
+def process_details():
+    # flush every window whose caller has gone quiet, or whose time is up
+    now = time.time()
+    for sender, record in list(STATE.items()):
+        details = record.get("details")
+        if not details or not (details["pending"] or details["dropped"] > details["dropped_reported"]):
+            continue
+        if now - details["last_at"] >= DETAILS_QUIET_SECONDS or now >= details["until"]:
+            try:
+                flush_details(sender)
+            except Exception as e:
+                print(f"[details error] {e}")
+
+
+def details_loop():
+    while True:
+        time.sleep(DETAILS_TICK_SECONDS)
+        process_details()
+
+
+def greet(sender, text):
+    # a new caller gets the fixed opening question, without a model call. The first message is kept as the
+    # summary, so a caller who wrote what happened and then taps "yes" still reaches the on-call group with it.
+    # The question goes into the history as if the model had asked it, so the model takes over from the answer.
+    summary = f"הודעה ראשונה: {text}"[:300]
+    yes_label, no_label = FALLBACK_QUESTION["yes_label"], FALLBACK_QUESTION["no_label"]
+    STATE[sender] = {"handoff": DEFAULT_HANDOFF, "summary": summary}
+    save_state()
+    asked = {
+        "assessment": "unclear",
+        "message": GREETING,
+        "yes_label": yes_label,
+        "no_label": no_label,
+        "handoff": DEFAULT_HANDOFF,
+        "summary": summary,
+    }
+    HISTORY[sender] = [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": json.dumps(asked, ensure_ascii=False)},
+    ]
+    print(f"[greeting] {sender} is a new caller")
+    send_question(sender, GREETING, yes_label, no_label)
+
+
+def reply_to(sender, text, button=None, item=None):
+    # item: how the message goes into the details window (see describe); a plain text message by default
+    record = STATE.get(sender, {})
+    if record.get("status") == "emergency":
+        # inside the details window: collect silently (a tapped button carries no details);
+        # after it: the fixed text, and never a model call or a new alert
+        if button or collect_detail(record, item or {"text": text, "line": f'"{text}"', "always": False}):
+            if not button:
+                print(f"[details] {sender}: message collected")
+            return
         print(f"[fixed reply] {sender} was already handed to a representative")
         send_text(sender, FOLLOWUP_REPLY)
         return
     if button == YES_ID:
-        record = STATE.get(sender, {})
-        declare_emergency(sender, record.get("handoff"), record.get("summary"))
+        declare_emergency(sender, record.get("summary"))
         return
     if button == NO_ID:
         text = f'[The person tapped "{text}": this is NOT an emergency]'
+    elif sender not in STATE and sender not in HISTORY:
+        greet(sender, text)
+        return
     history = HISTORY.setdefault(sender, [])
     history.append({"role": "user", "content": text})
     del history[:-MAX_HISTORY]
@@ -354,7 +547,7 @@ def reply_to(sender, text, button=None):
     print(f"[assessment {sender}] {verdict['assessment']}")
 
     if verdict["assessment"] == "emergency":
-        declare_emergency(sender, verdict.get("handoff") or verdict["message"], verdict.get("summary"))
+        declare_emergency(sender, verdict.get("summary"))
     elif verdict["assessment"] == "unclear":
         STATE[sender] = {"handoff": verdict.get("handoff"), "summary": verdict.get("summary")}
         save_state()
@@ -369,18 +562,26 @@ def reply_to(sender, text, button=None):
 
 
 def describe(message):
-    # (text for the model, tapped button id or None); a caller in trouble may send a pin or a voice
-    # note instead of words, and that still has to reach the model
+    # (text for the model, tapped button id or None, item for the details window); a caller in trouble may
+    # send a pin or a voice note instead of words, and that still has to reach the model and the group.
+    # item: "text" for the model, "line" as the on-call group sees it, "always" when the group gets it
+    # even if the model finds nothing new in it (a pin or media the model cannot judge)
     kind = message.get("type")
     if kind == "text":
-        return message["text"]["body"], None
+        text = message["text"]["body"]
+        return text, None, {"text": text, "line": f'"{text}"', "always": False}
     if kind == "interactive":
         reply = message["interactive"].get("button_reply") or {}
-        return reply.get("title", ""), reply.get("id")
+        return reply.get("title", ""), reply.get("id"), None
     if kind == "location":
         place = message["location"]
-        return f"[shared a location pin: {place.get('latitude')}, {place.get('longitude')} {place.get('name', '')}]", None
-    return f"[sent a {kind} message that cannot be read automatically]", None
+        lat, lon, name = place.get("latitude"), place.get("longitude"), place.get("name", "")
+        text = f"[shared a location pin: {lat}, {lon} {name}]"
+        line = f"📍 הפונה שיתף מיקום: https://maps.google.com/?q={lat},{lon}" + (f" ({name})" if name else "")
+        return text, None, {"text": text, "line": line, "always": True}
+    text = f"[sent a {kind} message that cannot be read automatically]"
+    line = f"📎 הפונה שלח {MEDIA_NAMES.get(kind, 'קובץ')}. לא ניתן להעביר את הקובץ לכאן, יש לבקש ממנו בשיחה"
+    return text, None, {"text": text, "line": line, "always": True}
 
 
 def handle_message(message):
@@ -390,9 +591,9 @@ def handle_message(message):
             return
         SEEN_IDS.append(message_id)
         del SEEN_IDS[:-500]
-        text, button = describe(message)
+        text, button, item = describe(message)
         print(f"[message from {sender}] {text}")
-        reply_to(sender, text, button)
+        reply_to(sender, text, button, item)
 
 
 def handle_payload(payload):
@@ -493,6 +694,8 @@ def chat():
 
 # alerts that failed (or were cut short by a restart) keep being retried until the group has them
 threading.Thread(target=alert_retry_loop, daemon=True).start()
+# caller details collected in a window are read and passed on in batches
+threading.Thread(target=details_loop, daemon=True).start()
 
 
 if __name__ == "__main__":

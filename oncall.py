@@ -9,13 +9,29 @@ import agent
 PATH = "/api/incident-report"
 
 
-def build_text(sender, summary):
+def build_text(sender):
     return (
         "🚨 פנייה דחופה בוואטסאפ\n"
         f"מספר: +{sender}\n"
-        f"תמצית: {summary}\n"
         "הפונה קיבל הודעה שנציג יחזור אליו בהקדם. יש לחזור אליו."
     )
+
+
+def build_details_text(sender, fields, lines, dropped=0):
+    # the model's fields first (the full picture so far), then the caller's new messages exactly as written,
+    # so a name or a number the model got wrong can always be checked against the original
+    parts = [f"📝 עדכון פרטים, פנייה מ-+{sender}"]
+    if any(fields.values()):
+        parts += [
+            f"שם: {fields.get('name') or 'לא נמסר'}",
+            f"מיקום: {fields.get('location') or 'לא נמסר'}",
+            f"מה קרה: {fields.get('what') or 'לא נמסר'}",
+        ]
+    if lines:
+        parts += ["", "הודעות חדשות מהפונה:", *lines]
+    if dropped:
+        parts.append(f"(הפונה שלח עוד {dropped} הודעות שלא הועברו, כי עבר אורך המקסימום)")
+    return "\n".join(parts)
 
 
 def send_report(incident_id, text):
