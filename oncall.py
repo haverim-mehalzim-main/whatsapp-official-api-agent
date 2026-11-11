@@ -8,6 +8,14 @@ import agent
 # unchanged, to its configured WhatsApp group
 PATH = "/api/incident-report"
 
+# each route on the incident bot accepts only its own event name (anything else is a 400), so a report built for
+# one route can never be posted to another route's group by mistake
+EVENT_BY_PATH = {
+    "/api/incident-report": "incident.opened",
+    "/api/volunteer-report": "volunteer.inquiry",
+    "/api/donation-report": "donation.inquiry",
+}
+
 
 def build_text(sender):
     return (
@@ -53,7 +61,7 @@ def send_report(incident_id, text, path=PATH):
     request = urllib.request.Request(
         base + path,
         data=json.dumps(
-            {"event": "incident.opened", "incident_id": incident_id, "report_text": text}
+            {"event": EVENT_BY_PATH.get(path, "incident.opened"), "incident_id": incident_id, "report_text": text}
         ).encode("utf-8"),
         method="POST",
         headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
