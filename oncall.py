@@ -23,7 +23,7 @@ def build_details_text(sender, fields, lines, dropped=0):
     parts = [f"📝 עדכון פרטים, פנייה מ-+{sender}"]
     if any(fields.values()):
         parts += [
-            f"שם: {fields.get('name') or 'לא נמסר'}",
+            f"שם הפונה: {fields.get('name') or 'לא נמסר'}",
             f"מיקום: {fields.get('location') or 'לא נמסר'}",
             f"מה קרה: {fields.get('what') or 'לא נמסר'}",
         ]

@@ -216,13 +216,16 @@ def system_prompt():
         return f.read().strip()
 
 
-def ask_claude(history, system=None, max_tokens=500):
+def ask_claude(history, system=None, max_tokens=1500, effort=None):
+    # the model thinks before it answers, and that thinking counts toward max_tokens: a cap sized only for
+    # the short JSON answer can be used up before any text is written, so leave room for both
     api_key = load_env().get("anthropic_api_key")
     if not api_key:
         raise RuntimeError("anthropic_api_key is empty in .env")
-    body = json.dumps(
-        {"model": MODEL, "max_tokens": max_tokens, "system": system or system_prompt(), "messages": history}
-    ).encode("utf-8")
+    request_body = {"model": MODEL, "max_tokens": max_tokens, "system": system or system_prompt(), "messages": history}
+    if effort:
+        request_body["output_config"] = {"effort": effort}
+    body = json.dumps(request_body).encode("utf-8")
     request = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=body,
@@ -238,7 +241,11 @@ def ask_claude(history, system=None, max_tokens=500):
             data = json.load(response)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Claude API error {e.code}: {e.read().decode('utf-8', 'replace')}")
-    return "".join(block.get("text", "") for block in data["content"]).strip()
+    text = "".join(block.get("text", "") for block in data["content"] if block.get("type") == "text").strip()
+    if not text:
+        # say why, so the log shows it (max_tokens: the thinking used up the cap; refusal: the model declined)
+        raise RuntimeError(f"the model answered with no text (stop_reason={data.get('stop_reason')})")
+    return text
 
 
 def parse_verdict(raw):
@@ -383,7 +390,8 @@ def details_prompt():
 def extract_details(known, texts):
     # one short model call: what is known so far plus only the new messages; returns (fields, is_new)
     content = json.dumps({"known": known, "new_messages": texts}, ensure_ascii=False)
-    raw = ask_claude([{"role": "user", "content": content}], system=details_prompt(), max_tokens=300)
+    # a simple extraction: little thinking, with room left for it and for the answer
+    raw = ask_claude([{"role": "user", "content": content}], system=details_prompt(), max_tokens=1024, effort="low")
     answer = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
     fields = {key: str(answer.get(key) or "").strip() for key in ("name", "location", "what")}
     return fields, bool(answer.get("new"))
