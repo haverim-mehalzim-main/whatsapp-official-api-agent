@@ -86,6 +86,8 @@ TOPICS = {
 }
 TOPIC_FOLLOWUP = "קיבלנו, ניצור איתך קשר בהקדם"
 TOPIC_WINDOW_SECONDS = 3 * 3600
+# after an emergency the number gets only the fixed text; this long after the handover it starts over
+EMERGENCY_RELEASE_SECONDS = 24 * 3600
 MENU_MISSES_BEFORE_GENERAL = 2  # unclear answers to the menu; the second one is passed on as a general inquiry
 OUTBOX_KEY = "__outbox__"  # reports still waiting to be sent after their caller started over
 # a first message that is only a greeting is left out of the reports to the group
@@ -626,10 +628,16 @@ def send_topic_reports(record):
 
 
 def start_over(sender):
-    # the topic window is over: forget the caller so the next message gets the greeting again, keeping any
-    # report that is still waiting to be sent
+    # the topic window or the emergency block is over: forget the caller so the next message gets the greeting
+    # again, keeping anything still waiting to be sent (in order: the emergency alert, then its updates)
     record = STATE.pop(sender, {})
-    unsent = [report for report in record.get("reports", []) if not report["sent"]]
+    unsent = []
+    if record.get("alert") == "pending":
+        unsent.append({"id": record["incident_id"], "path": oncall.PATH, "text": oncall.build_text(sender), "sent": False})
+    for update in (record.get("details") or {}).get("updates", []):
+        if not update["sent"]:
+            unsent.append({"id": update["id"], "path": oncall.PATH, "text": update["text"], "sent": False})
+    unsent += [report for report in record.get("reports", []) if not report["sent"]]
     if unsent:
         STATE.setdefault(OUTBOX_KEY, {"reports": []})["reports"].extend(unsent)
     HISTORY.pop(sender, None)
@@ -674,6 +682,10 @@ def reply_to(sender, text, button=None, item=None):
     # item: how the message goes into the details window (see describe); a plain text message by default
     item = item or {"text": text, "line": None, "always": False}
     record = STATE.get(sender, {})
+    if record.get("status") == "emergency" and alert_age(record) >= EMERGENCY_RELEASE_SECONDS:
+        # a day after the handover the number is released: a new emergency must reach the group again
+        start_over(sender)
+        record = {}
     if record.get("status") == "emergency":
         # inside the details window: collect silently (a tapped button carries no details);
         # after it: the fixed text, and never a model call or a new alert
