@@ -34,16 +34,24 @@ def build_details_text(sender, fields, lines, dropped=0):
     return "\n".join(parts)
 
 
-def send_report(incident_id, text):
+def build_topic_text(sender, header, body, lines):
+    # a non-emergency inquiry (information, volunteering, donation, general), with what the caller wrote, as written
+    parts = [header, f"מספר: +{sender}", body]
+    if lines:
+        parts += ["", "מה שהפונה כתב:", *lines]
+    return "\n".join(parts)
+
+
+def send_report(incident_id, text, path=PATH):
     # returns True once the incident bot has accepted the report; the incident id makes retries safe,
-    # because the bot ignores a report id it already received
+    # because the bot ignores a report id it already received. path picks the route, and so the group
     env = agent.load_env()
     base, secret = env.get("incident_agent_url", "").rstrip("/"), env.get("incident_agent_secret", "")
     if not base or not secret:
         print("[oncall error] incident_agent_url / incident_agent_secret are empty (.env or environment variables)")
         return False
     request = urllib.request.Request(
-        base + PATH,
+        base + path,
         data=json.dumps(
             {"event": "incident.opened", "incident_id": incident_id, "report_text": text}
         ).encode("utf-8"),
@@ -54,7 +62,7 @@ def send_report(incident_id, text):
         with urllib.request.urlopen(request, timeout=15) as response:
             result = json.load(response)
     except urllib.error.HTTPError as e:
-        print(f"[oncall error] incident bot answered {e.code}")
+        print(f"[oncall error] incident bot answered {e.code} on {path}")
         return False
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"[oncall error] {e}")

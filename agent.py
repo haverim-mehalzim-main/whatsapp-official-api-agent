@@ -50,6 +50,46 @@ MAX_DETAIL_CHARS = 500  # per message
 MAX_WINDOW_CHARS = 2000  # per window; what goes past it is counted, not read
 MAX_DETAIL_CALLS = 5  # model calls per window; past it, batches go to the group as written
 MAX_INTAKE = 10  # caller messages kept from before the handover, passed into the window on "yes"
+
+# the "no" path: a menu of three topics. Each topic answers the caller with a fixed text and posts one report to
+# its route on the incident bot; for TOPIC_WINDOW_SECONDS afterwards every message gets TOPIC_FOLLOWUP, then the
+# caller starts over with the greeting. A caller whose message fits no topic, even after the menu was sent again,
+# is passed on as a general inquiry.
+MENU_TEXT = "הבנתי. במה נוכל לעזור?"
+MENU_BUTTONS = (("topic_info", "מסירת מידע"), ("topic_volunteer", "התנדבות"), ("topic_donation", "תרומות"))
+TOPIC_BY_BUTTON = {"topic_info": "info", "topic_volunteer": "volunteer", "topic_donation": "donation"}
+TOPICS = {
+    "info": {
+        "reply": "מעולה, כונן שלנו ייצור איתך קשר בהקדם",
+        "path": "/api/incident-report",  # the operational on-call group, marked as information, not an emergency
+        "header": "ℹ️ פנייה למסירת מידע בוואטסאפ",
+        "body": "הפונה כתב כדי למסור מידע על אירוע. יש לחזור אליו.",
+    },
+    "volunteer": {
+        "reply": "מעולה, אנחנו ניצור איתך קשר בהקדם",
+        "path": "/api/volunteer-report",
+        "header": "🙋 פנייה להתנדבות בוואטסאפ",
+        "body": "הפונה רוצה להתנדב. יש לחזור אליו.",
+    },
+    "donation": {
+        "reply": "מעולה, אנחנו ניצור איתך קשר בהקדם",
+        "path": "/api/donation-report",
+        "header": "💙 פנייה לתרומה בוואטסאפ",
+        "body": "הפונה רוצה לתרום. יש לחזור אליו.",
+    },
+    "general": {
+        "reply": "קיבלנו, ניצור איתך קשר בהקדם",
+        "path": "/api/volunteer-report",  # the non-operational group, so someone sees it
+        "header": "📩 פנייה כללית בוואטסאפ",
+        "body": "הפונה כתב בנושא שאינו חירום, מסירת מידע, התנדבות או תרומה. יש לחזור אליו.",
+    },
+}
+TOPIC_FOLLOWUP = "קיבלנו, ניצור איתך קשר בהקדם"
+TOPIC_WINDOW_SECONDS = 3 * 3600
+MENU_MISSES_BEFORE_GENERAL = 2  # unclear answers to the menu; the second one is passed on as a general inquiry
+OUTBOX_KEY = "__outbox__"  # reports still waiting to be sent after their caller started over
+# a first message that is only a greeting is left out of the reports to the group
+GREETINGS = {"היי", "הי", "שלום", "אהלן", "הלו", "בוקר טוב", "ערב טוב", "צהריים טובים", "hi", "hello", "hey"}
 MEDIA_NAMES = {"audio": "הקלטה", "voice": "הקלטה", "image": "תמונה", "video": "סרטון", "document": "מסמך", "sticker": "מדבקה"}
 DEFAULT_HANDOFF = (
     "קיבלנו. נציג שלנו יחזור אליך בהקדם האפשרי כדי לברר פרטים נוספים. / "
@@ -255,6 +295,8 @@ def parse_verdict(raw):
         raise ValueError("unknown assessment")
     if not str(verdict.get("message", "")).strip():
         raise ValueError("empty message")
+    if verdict.get("topic") not in ("info", "volunteer", "donation"):
+        verdict["topic"] = "unclear"
     return verdict
 
 
@@ -268,14 +310,16 @@ def send_text(to, text):
 
 
 def send_question(to, text, yes_label, no_label):
-    # two tap buttons; they only work inside the 24h window, which is always open after a message
-    print(f"[question to {to}] {text}  [{yes_label}] [{no_label}]")
+    send_buttons(to, text, ((YES_ID, yes_label), (NO_ID, no_label)))
+
+
+def send_buttons(to, text, choices):
+    # up to three tap buttons, each (id, title of at most 20 characters); they only work inside the 24h window,
+    # which is always open after a message
+    print(f"[question to {to}] {text}  " + " ".join(f"[{title}]" for _, title in choices))
     if DRY_RUN:
         return
-    buttons = [
-        {"type": "reply", "reply": {"id": YES_ID, "title": yes_label[:20]}},
-        {"type": "reply", "reply": {"id": NO_ID, "title": no_label[:20]}},
-    ]
+    buttons = [{"type": "reply", "reply": {"id": button_id, "title": title[:20]}} for button_id, title in choices]
     result = send_test.send(
         to,
         {
@@ -312,6 +356,7 @@ def retry_pending_alerts():
     for record in list(STATE.values()):
         try:
             send_detail_updates(record)
+            send_topic_reports(record)
         except Exception as e:
             print(f"[details retry error] {e}")
     for sender in [s for s, r in list(STATE.items()) if r.get("alert") == "pending"]:
@@ -503,6 +548,95 @@ def details_loop():
         process_details()
 
 
+def show_menu(sender, tapped_note=None):
+    # the caller said it is not an emergency: offer the three topics. A tapped "no" never reaches the model,
+    # so it goes into the history here, as if the model had answered it, for the model to take over from
+    record = STATE.setdefault(sender, {})
+    record.update(stage="menu", menu_misses=0)
+    save_state()
+    if tapped_note:
+        history = HISTORY.setdefault(sender, [])
+        answered = {"assessment": "not_emergency", "topic": "unclear", "message": MENU_TEXT}
+        history.append({"role": "user", "content": tapped_note})
+        history.append({"role": "assistant", "content": json.dumps(answered, ensure_ascii=False)})
+        del history[:-MAX_HISTORY]
+    send_buttons(sender, MENU_TEXT, MENU_BUTTONS)
+
+
+def handover_topic(sender, topic):
+    # pass the caller on: the fixed text for the topic, and one report to its route with what they wrote
+    spec = TOPICS[topic]
+    now = int(time.time())
+    lines = intake_lines(STATE.get(sender, {}).get("intake"))
+    report = {
+        "id": f"wa-{topic}-{sender}-{now}",
+        "path": spec["path"],
+        "text": oncall.build_topic_text(sender, spec["header"], spec["body"], lines),
+        "sent": False,
+    }
+    STATE[sender] = {"status": "topic", "topic": topic, "since": now, "reports": [report]}
+    save_state()
+    HISTORY.pop(sender, None)
+    print(f"[topic] {sender}: {topic}")
+    send_text(sender, spec["reply"])
+    send_topic_reports(STATE[sender])
+
+
+def is_bare_greeting(text):
+    words = "".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace()).split()
+    return " ".join(words) in GREETINGS
+
+
+def intake_lines(intake):
+    # what the caller wrote before, as the group sees it: without a bare greeting, within the same caps
+    lines, total = [], 0
+    for item in intake or []:
+        if not item.get("line") and is_bare_greeting(item["text"]):
+            continue
+        text = item["text"][:MAX_DETAIL_CHARS]
+        if total + len(text) > MAX_WINDOW_CHARS:
+            break
+        total += len(text)
+        lines.append(line_of({**item, "text": text}))
+    return lines
+
+
+def send_topic_reports(record):
+    # safe to repeat, the incident bot ignores an id it already has. A route the incident bot does not have yet
+    # answers 404: the report waits and is tried again, less and less often, and never goes to another group
+    now = time.time()
+    for report in record.get("reports", []):
+        if report["sent"] or now < report.get("next_try", 0):
+            continue
+        if DRY_RUN:
+            print(f"[dry run] would post to {report['path']}:\n{report['text']}")
+            ok = True
+        else:
+            ok = oncall.send_report(report["id"], report["text"], path=report["path"])
+        if ok:
+            report["sent"] = True
+        else:
+            report["tries"] = report.get("tries", 0) + 1
+            wait = min(ALERT_RETRY_SECONDS * 2 ** report["tries"], 1800)
+            report["next_try"] = now + wait
+            print(f"[REPORT NOT SENT] {report['id']} to {report['path']}, next try in {wait} seconds")
+        save_state()
+    if record is STATE.get(OUTBOX_KEY):
+        record["reports"] = [report for report in record["reports"] if not report["sent"]]
+
+
+def start_over(sender):
+    # the topic window is over: forget the caller so the next message gets the greeting again, keeping any
+    # report that is still waiting to be sent
+    record = STATE.pop(sender, {})
+    unsent = [report for report in record.get("reports", []) if not report["sent"]]
+    if unsent:
+        STATE.setdefault(OUTBOX_KEY, {"reports": []})["reports"].extend(unsent)
+    HISTORY.pop(sender, None)
+    save_state()
+    print(f"[start over] {sender}")
+
+
 def remember_intake(sender, item):
     # what the caller writes before the handover is kept, so that on "yes" it goes into the details window
     # like an answer to the questions: a caller who told the whole story first still reaches the on-call group
@@ -550,16 +684,27 @@ def reply_to(sender, text, button=None, item=None):
         print(f"[fixed reply] {sender} was already handed to a representative")
         send_text(sender, FOLLOWUP_REPLY)
         return
+    if record.get("status") == "topic":
+        # handed to a person for a non-emergency topic: the fixed text for a while, then a fresh start
+        if time.time() - record.get("since", 0) < TOPIC_WINDOW_SECONDS:
+            print(f"[fixed reply] {sender} was already passed on ({record.get('topic')})")
+            send_text(sender, TOPIC_FOLLOWUP)
+            return
+        start_over(sender)
+        record = {}
     if button == YES_ID:
         declare_emergency(sender, record.get("summary"), record.get("intake"))
         return
+    if button in TOPIC_BY_BUTTON:
+        handover_topic(sender, TOPIC_BY_BUTTON[button])
+        return
     if button == NO_ID:
-        text = f'[The person tapped "{text}": this is NOT an emergency]'
-    elif sender not in STATE and sender not in HISTORY:
+        show_menu(sender, f'[The person tapped "{text}": this is NOT an emergency]')
+        return
+    if sender not in STATE and sender not in HISTORY:
         greet(sender, text, item)
         return
-    else:
-        remember_intake(sender, item)
+    remember_intake(sender, item)
     history = HISTORY.setdefault(sender, [])
     history.append({"role": "user", "content": text})
     del history[:-MAX_HISTORY]
@@ -579,10 +724,25 @@ def reply_to(sender, text, button=None, item=None):
             verdict = FALLBACK_QUESTION
             raw = json.dumps(verdict, ensure_ascii=False)
         history.append({"role": "assistant", "content": raw})
-    print(f"[assessment {sender}] {verdict['assessment']}")
+    topic = verdict.get("topic", "unclear")
+    print(f"[assessment {sender}] {verdict['assessment']}, topic {topic}")
+    at_menu = STATE.get(sender, {}).get("stage") == "menu"
 
     if verdict["assessment"] == "emergency":
         declare_emergency(sender, verdict.get("summary"), STATE.get(sender, {}).get("intake"))
+    elif topic != "unclear" and (at_menu or verdict["assessment"] == "not_emergency"):
+        handover_topic(sender, topic)
+    elif at_menu:
+        # the caller already said it is not an emergency and wrote something that fits no topic
+        record = STATE[sender]
+        record["menu_misses"] = record.get("menu_misses", 0) + 1
+        if record["menu_misses"] >= MENU_MISSES_BEFORE_GENERAL:
+            handover_topic(sender, "general")
+        else:
+            save_state()
+            send_buttons(sender, MENU_TEXT, MENU_BUTTONS)
+    elif verdict["assessment"] == "not_emergency":
+        show_menu(sender)
     elif verdict["assessment"] == "unclear":
         STATE.setdefault(sender, {}).update({"handoff": verdict.get("handoff"), "summary": verdict.get("summary")})
         save_state()
@@ -592,8 +752,6 @@ def reply_to(sender, text, button=None, item=None):
             verdict.get("yes_label") or FALLBACK_QUESTION["yes_label"],
             verdict.get("no_label") or FALLBACK_QUESTION["no_label"],
         )
-    else:
-        send_text(sender, verdict["message"])
 
 
 def describe(message):
@@ -716,10 +874,14 @@ class Webhook(BaseHTTPRequestHandler):
 
 def chat():
     # talk to the agent in the terminal, nothing is sent to WhatsApp or to the on-call group
-    print("Chatting with the agent (Ctrl+C to quit). Type /yes or /no to tap the answer buttons.")
+    print("Chatting with the agent (Ctrl+C to quit). Type /yes or /no to tap the answer buttons, "
+          "/info, /volunteer or /donation to tap a menu button.")
+    menu = {"/info": "topic_info", "/volunteer": "topic_volunteer", "/donation": "topic_donation"}
     while True:
         text = input("you: ")
-        if text == "/yes":
+        if text in menu:
+            reply_to("terminal", text, menu[text])
+        elif text == "/yes":
             reply_to("terminal", "Yes", YES_ID)
         elif text == "/no":
             reply_to("terminal", "No", NO_ID)
