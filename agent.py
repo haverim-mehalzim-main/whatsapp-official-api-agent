@@ -49,6 +49,7 @@ DETAILS_TICK_SECONDS = 5
 MAX_DETAIL_CHARS = 500  # per message
 MAX_WINDOW_CHARS = 2000  # per window; what goes past it is counted, not read
 MAX_DETAIL_CALLS = 5  # model calls per window; past it, batches go to the group as written
+MAX_INTAKE = 10  # caller messages kept from before the handover, passed into the window on "yes"
 MEDIA_NAMES = {"audio": "הקלטה", "voice": "הקלטה", "image": "תמונה", "video": "סרטון", "document": "מסמך", "sticker": "מדבקה"}
 DEFAULT_HANDOFF = (
     "קיבלנו. נציג שלנו יחזור אליך בהקדם האפשרי כדי לברר פרטים נוספים. / "
@@ -335,9 +336,10 @@ def alert_retry_loop():
         retry_pending_alerts()
 
 
-def declare_emergency(sender, summary):
+def declare_emergency(sender, summary, intake=None):
     # from here on the conversation belongs to a person: the model never answers it again. The caller gets the
     # fixed handoff and the details questions, the on-call group gets the first alert, and the details window opens
+    # with what the caller wrote before the handover already in it
     now = int(time.time())
     STATE[sender] = {
         "status": "emergency",
@@ -357,6 +359,8 @@ def declare_emergency(sender, summary):
             "updates": [],  # [{"id", "text", "sent"}], posted to the group in order, after the first alert
         },
     }
+    for item in intake or []:
+        add_detail(STATE[sender]["details"], item)
     save_state()
     HISTORY.pop(sender, None)
     # the caller first, so they are never kept waiting on the incident bot; the alert is retried if it fails
@@ -370,16 +374,27 @@ def collect_detail(record, item):
     details = record.get("details")
     if not details or time.time() >= details["until"]:
         return False
-    room = MAX_WINDOW_CHARS - details["chars"]
-    if room <= 0:
-        details["dropped"] += 1
-    else:
-        text = item["text"][: min(MAX_DETAIL_CHARS, room)]
-        details["chars"] += len(text)
-        details["pending"].append({**item, "text": text})
+    add_detail(details, item)
     details["last_at"] = time.time()
     save_state()
     return True
+
+
+def add_detail(details, item):
+    # within the caps: up to MAX_DETAIL_CHARS per message and MAX_WINDOW_CHARS per window; past them, only counted
+    room = MAX_WINDOW_CHARS - details["chars"]
+    if room <= 0:
+        details["dropped"] += 1
+        return
+    text = item["text"][: min(MAX_DETAIL_CHARS, room)]
+    details["chars"] += len(text)
+    details["pending"].append({**item, "text": text})
+
+
+def line_of(item):
+    # how a collected message shows in the group: a text message as its (capped) text in quotes,
+    # a pin or media as the line describe() wrote for it
+    return item.get("line") or f'"{item["text"]}"'
 
 
 def details_prompt():
@@ -437,7 +452,7 @@ def flush_details(sender):
             details["updates"].append(
                 {
                     "id": f"{record['incident_id']}-details-{number}",
-                    "text": oncall.build_details_text(sender, fields, [item["line"] for item in batch], new_dropped),
+                    "text": oncall.build_details_text(sender, fields, [line_of(item) for item in batch], new_dropped),
                     "sent": False,
                 }
             )
@@ -488,13 +503,22 @@ def details_loop():
         process_details()
 
 
-def greet(sender, text):
+def remember_intake(sender, item):
+    # what the caller writes before the handover is kept, so that on "yes" it goes into the details window
+    # like an answer to the questions: a caller who told the whole story first still reaches the on-call group
+    intake = STATE.setdefault(sender, {}).setdefault("intake", [])
+    intake.append(item)
+    del intake[:-MAX_INTAKE]
+    save_state()
+
+
+def greet(sender, text, item):
     # a new caller gets the fixed opening question, without a model call. The first message is kept as the
-    # summary, so a caller who wrote what happened and then taps "yes" still reaches the on-call group with it.
+    # summary (the backup SMS uses it) and as the first intake item.
     # The question goes into the history as if the model had asked it, so the model takes over from the answer.
     summary = f"הודעה ראשונה: {text}"[:300]
     yes_label, no_label = FALLBACK_QUESTION["yes_label"], FALLBACK_QUESTION["no_label"]
-    STATE[sender] = {"handoff": DEFAULT_HANDOFF, "summary": summary}
+    STATE[sender] = {"handoff": DEFAULT_HANDOFF, "summary": summary, "intake": [item]}
     save_state()
     asked = {
         "assessment": "unclear",
@@ -514,11 +538,12 @@ def greet(sender, text):
 
 def reply_to(sender, text, button=None, item=None):
     # item: how the message goes into the details window (see describe); a plain text message by default
+    item = item or {"text": text, "line": None, "always": False}
     record = STATE.get(sender, {})
     if record.get("status") == "emergency":
         # inside the details window: collect silently (a tapped button carries no details);
         # after it: the fixed text, and never a model call or a new alert
-        if button or collect_detail(record, item or {"text": text, "line": f'"{text}"', "always": False}):
+        if button or collect_detail(record, item):
             if not button:
                 print(f"[details] {sender}: message collected")
             return
@@ -526,13 +551,15 @@ def reply_to(sender, text, button=None, item=None):
         send_text(sender, FOLLOWUP_REPLY)
         return
     if button == YES_ID:
-        declare_emergency(sender, record.get("summary"))
+        declare_emergency(sender, record.get("summary"), record.get("intake"))
         return
     if button == NO_ID:
         text = f'[The person tapped "{text}": this is NOT an emergency]'
     elif sender not in STATE and sender not in HISTORY:
-        greet(sender, text)
+        greet(sender, text, item)
         return
+    else:
+        remember_intake(sender, item)
     history = HISTORY.setdefault(sender, [])
     history.append({"role": "user", "content": text})
     del history[:-MAX_HISTORY]
@@ -555,9 +582,9 @@ def reply_to(sender, text, button=None, item=None):
     print(f"[assessment {sender}] {verdict['assessment']}")
 
     if verdict["assessment"] == "emergency":
-        declare_emergency(sender, verdict.get("summary"))
+        declare_emergency(sender, verdict.get("summary"), STATE.get(sender, {}).get("intake"))
     elif verdict["assessment"] == "unclear":
-        STATE[sender] = {"handoff": verdict.get("handoff"), "summary": verdict.get("summary")}
+        STATE.setdefault(sender, {}).update({"handoff": verdict.get("handoff"), "summary": verdict.get("summary")})
         save_state()
         send_question(
             sender,
@@ -577,7 +604,7 @@ def describe(message):
     kind = message.get("type")
     if kind == "text":
         text = message["text"]["body"]
-        return text, None, {"text": text, "line": f'"{text}"', "always": False}
+        return text, None, {"text": text, "line": None, "always": False}  # line None: the text, quoted
     if kind == "interactive":
         reply = message["interactive"].get("button_reply") or {}
         return reply.get("title", ""), reply.get("id"), None
