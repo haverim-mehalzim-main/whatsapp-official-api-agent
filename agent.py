@@ -41,11 +41,10 @@ HANDOFF_TEXT = "מיד אצור איתך קשר ממספר אחר"
 DETAILS_QUESTIONS = "בינתיים תכתוב לי בבקשה\nמה השם המלא שלך?\nאיפה בעולם קרה האירוע?\nתיאור קצר של מה קרה."
 
 # the details window: for this long after the questions, what the caller writes is collected (no reply to the
-# caller), read by the model in small batches, and passed to the on-call group as updates
+# caller); when it ends, the model reads everything once and one update goes to the on-call group
 DETAILS_PROMPT_FILE = os.path.join(HERE, "details_prompt.txt")
 DETAILS_WINDOW_SECONDS = 300
-DETAILS_QUIET_SECONDS = 30  # a batch goes to the model once the caller has stopped writing for this long
-DETAILS_TICK_SECONDS = 5
+DETAILS_TICK_SECONDS = 5  # how often closed windows are looked for
 MAX_DETAIL_CHARS = 500  # per message
 MAX_WINDOW_CHARS = 2000  # per window; what goes past it is counted, not read
 MAX_DETAIL_CALLS = 5  # model calls per window; past it, batches go to the group as written
@@ -531,13 +530,13 @@ def send_detail_updates(record):
 
 
 def process_details():
-    # flush every window whose caller has gone quiet, or whose time is up
+    # flush every window whose time is up: one model call and one update with all that was collected
     now = time.time()
     for sender, record in list(STATE.items()):
         details = record.get("details")
         if not details or not (details["pending"] or details["dropped"] > details["dropped_reported"]):
             continue
-        if now - details["last_at"] >= DETAILS_QUIET_SECONDS or now >= details["until"]:
+        if now >= details["until"]:
             try:
                 flush_details(sender)
             except Exception as e:

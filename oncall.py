@@ -36,7 +36,7 @@ def build_details_text(sender, fields, lines, dropped=0):
             f"מה קרה: {fields.get('what') or 'לא נמסר'}",
         ]
     if lines:
-        parts += ["", "הודעות חדשות מהפונה:", *lines]
+        parts += ["", "הודעות הפונה:", *lines]
     if dropped:
         parts.append(f"(הפונה שלח עוד {dropped} הודעות שלא הועברו, כי עבר אורך המקסימום)")
     return "\n".join(parts)
