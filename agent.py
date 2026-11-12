@@ -57,6 +57,7 @@ MAX_INTAKE = 10  # caller messages kept from before the handover, passed into th
 MENU_TEXT = "הבנתי. במה נוכל לעזור?"
 MENU_BUTTONS = (("topic_info", "מסירת מידע"), ("topic_volunteer", "התנדבות"), ("topic_donation", "תרומות"))
 TOPIC_BY_BUTTON = {"topic_info": "info", "topic_volunteer": "volunteer", "topic_donation": "donation"}
+VOLUNTEER_FORM_URL = "https://forms.monday.com/forms/2c04f95ad95a484c607ef71912af4e23?r=euc1"  # volunteer sign-up
 TOPICS = {
     "info": {
         "reply": "מעולה, כונן שלנו ייצור איתך קשר בהקדם",
@@ -65,7 +66,11 @@ TOPICS = {
         "body": "הפונה כתב כדי למסור מידע על אירוע. יש לחזור אליו.",
     },
     "volunteer": {
-        "reply": "מעולה, אנחנו ניצור איתך קשר בהקדם",
+        "reply": (
+            "מעולה, אנחנו ניצור איתך קשר בהקדם.\n"
+            "בינתיים אפשר להירשם כמתנדב בטופס הזה:\n"
+            f"{VOLUNTEER_FORM_URL}"
+        ),
         "path": "/api/volunteer-report",
         "header": "🙋 פנייה להתנדבות בוואטסאפ",
         "body": "הפונה רוצה להתנדב. יש לחזור אליו.",
