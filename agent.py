@@ -348,7 +348,7 @@ def try_alert(sender):
         print(f"[dry run] would post to the on-call group:\n{text}")
         ok = True
     else:
-        ok = oncall.send_report(record["incident_id"], text)
+        ok = oncall.send_report(record["incident_id"], text, fields=emergency_fields(sender))
     if ok:
         record["alert"] = "sent"
         save_state()
@@ -504,6 +504,11 @@ def flush_details(sender):
                 {
                     "id": f"{record['incident_id']}-details-{number}",
                     "text": oncall.build_details_text(sender, fields, [line_of(item) for item in batch], new_dropped),
+                    "fields": {
+                        **emergency_fields(sender),
+                        "parent_incident_id": record["incident_id"],
+                        "details": dict(fields),
+                    },
                     "sent": False,
                 }
             )
@@ -511,6 +516,18 @@ def flush_details(sender):
     finally:
         FLUSHING.discard(sender)
     send_detail_updates(record)
+
+
+def emergency_fields(sender):
+    return {"caller_phone": digits(sender), "inquiry_type": "emergency"}
+
+
+def update_fields(record, update):
+    # updates queued before these fields existed carry none: rebuild what can be known from the incident id
+    if update.get("fields"):
+        return update["fields"]
+    caller = str(record.get("incident_id", "")).split("-")[1:2] or [""]
+    return {**emergency_fields(caller[0]), "parent_incident_id": record.get("incident_id", "")}
 
 
 def send_detail_updates(record):
@@ -526,7 +543,7 @@ def send_detail_updates(record):
             print(f"[dry run] would post to the on-call group:\n{update['text']}")
             ok = True
         else:
-            ok = oncall.send_report(update["id"], update["text"])
+            ok = oncall.send_report(update["id"], update["text"], fields=update_fields(record, update))
         if not ok:
             print(f"[UPDATE NOT SENT] {update['id']}, will retry")
             return
@@ -578,6 +595,7 @@ def handover_topic(sender, topic):
         "id": f"wa-{topic}-{sender}-{now}",
         "path": spec["path"],
         "text": oncall.build_topic_text(sender, spec["header"], spec["body"], lines),
+        "fields": {"caller_phone": digits(sender), "inquiry_type": topic},
         "sent": False,
     }
     STATE[sender] = {"status": "topic", "topic": topic, "since": now, "reports": [report]}
@@ -618,7 +636,7 @@ def send_topic_reports(record):
             print(f"[dry run] would post to {report['path']}:\n{report['text']}")
             ok = True
         else:
-            ok = oncall.send_report(report["id"], report["text"], path=report["path"])
+            ok = oncall.send_report(report["id"], report["text"], path=report["path"], fields=report.get("fields"))
         if ok:
             report["sent"] = True
         else:
@@ -637,10 +655,12 @@ def start_over(sender):
     record = STATE.pop(sender, {})
     unsent = []
     if record.get("alert") == "pending":
-        unsent.append({"id": record["incident_id"], "path": oncall.PATH, "text": oncall.build_text(sender), "sent": False})
+        unsent.append({"id": record["incident_id"], "path": oncall.PATH, "text": oncall.build_text(sender),
+                       "fields": emergency_fields(sender), "sent": False})
     for update in (record.get("details") or {}).get("updates", []):
         if not update["sent"]:
-            unsent.append({"id": update["id"], "path": oncall.PATH, "text": update["text"], "sent": False})
+            unsent.append({"id": update["id"], "path": oncall.PATH, "text": update["text"],
+                           "fields": update_fields(record, update), "sent": False})
     unsent += [report for report in record.get("reports", []) if not report["sent"]]
     if unsent:
         STATE.setdefault(OUTBOX_KEY, {"reports": []})["reports"].extend(unsent)

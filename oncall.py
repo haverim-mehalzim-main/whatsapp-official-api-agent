@@ -50,19 +50,22 @@ def build_topic_text(sender, header, body, lines):
     return "\n".join(parts)
 
 
-def send_report(incident_id, text, path=PATH):
+def send_report(incident_id, text, path=PATH, fields=None):
     # returns True once the incident bot has accepted the report; the incident id makes retries safe,
-    # because the bot ignores a report id it already received. path picks the route, and so the group
+    # because the bot ignores a report id it already received. path picks the route, and so the group.
+    # fields: the optional structured fields the incident bot uses for its inquiries board on monday
+    # (caller_phone, inquiry_type, and on a details update parent_incident_id and details); the group still
+    # gets report_text exactly as written
     env = agent.load_env()
     base, secret = env.get("incident_agent_url", "").rstrip("/"), env.get("incident_agent_secret", "")
     if not base or not secret:
         print("[oncall error] incident_agent_url / incident_agent_secret are empty (.env or environment variables)")
         return False
+    body = {"event": EVENT_BY_PATH.get(path, "incident.opened"), "incident_id": incident_id, "report_text": text}
+    body.update(fields or {})
     request = urllib.request.Request(
         base + path,
-        data=json.dumps(
-            {"event": EVENT_BY_PATH.get(path, "incident.opened"), "incident_id": incident_id, "report_text": text}
-        ).encode("utf-8"),
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
         headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
     )
